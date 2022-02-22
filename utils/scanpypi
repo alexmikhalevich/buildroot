@@ -744,6 +744,8 @@ def main():
             req_not_found = package.get_requirements(pkg_folder, is_pep0517)
             req_not_found = req_not_found.difference(packages)
 
+            req_not_found.discard("pywin32")
+
             packages += req_not_found
             if req_not_found:
                 print('Added packages \'{pkgs}\' as dependencies of {pkg}'
