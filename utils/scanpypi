@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 
 Utility for building Buildroot packages for existing PyPI packages
@@ -6,8 +6,6 @@ Utility for building Buildroot packages for existing PyPI packages
 Any package built by scanpypi should be manually checked for
 errors.
 """
-from __future__ import print_function
-from __future__ import absolute_import
 import argparse
 import json
 import sys
@@ -22,16 +20,11 @@ import textwrap
 import tempfile
 import imp
 from functools import wraps
-import six.moves.urllib.request
-import six.moves.urllib.error
-import six.moves.urllib.parse
-from six.moves import map
-from six.moves import zip
-from six.moves import input
-if six.PY2:
-    import StringIO
-else:
-    import io
+import urllib.request
+import urllib.error
+import urllib.parse
+import io
+from setuptools.config import read_configuration
 
 BUF_SIZE = 65536
 
@@ -157,15 +150,15 @@ class BuildrootPackage():
         self.metadata_url = 'https://pypi.org/pypi/{pkg}/json'.format(
             pkg=self.real_name)
         try:
-            pkg_json = six.moves.urllib.request.urlopen(self.metadata_url).read().decode()
-        except six.moves.urllib.error.HTTPError as error:
+            pkg_json = urllib.request.urlopen(self.metadata_url).read().decode()
+        except urllib.error.HTTPError as error:
             print('ERROR:', error.getcode(), error.msg, file=sys.stderr)
             print('ERROR: Could not find package {pkg}.\n'
                   'Check syntax inside the python package index:\n'
                   'https://pypi.python.org/pypi/ '
                   .format(pkg=self.real_name))
             raise
-        except six.moves.urllib.error.URLError:
+        except urllib.error.URLError:
             print('ERROR: Could not find package {pkg}.\n'
                   'Check syntax inside the python package index:\n'
                   'https://pypi.python.org/pypi/ '
@@ -192,7 +185,7 @@ class BuildrootPackage():
                 'digests': None}]
             # In this case, we can't get the name of the downloaded file
             # from the pypi api, so we need to find it, this should work
-            urlpath = six.moves.urllib.parse.urlparse(
+            urlpath = urllib.parse.urlparse(
                 self.metadata['info']['download_url']).path
             # urlparse().path give something like
             # /path/to/file-version.tar.gz
@@ -204,8 +197,8 @@ class BuildrootPackage():
             try:
                 print('Downloading package {pkg} from {url}...'.format(
                     pkg=self.real_name, url=download_url['url']))
-                download = six.moves.urllib.request.urlopen(download_url['url'])
-            except six.moves.urllib.error.HTTPError as http_error:
+                download = urllib.request.urlopen(download_url['url'])
+            except urllib.error.HTTPError as http_error:
                 download = http_error
             else:
                 self.used_url = download_url
@@ -220,7 +213,7 @@ class BuildrootPackage():
             raise DownloadFailed('Failed to download package {pkg}: '
                                  'No source archive available'
                                  .format(pkg=self.real_name))
-        elif download.__class__ == six.moves.urllib.error.HTTPError:
+        elif download.__class__ == urllib.error.HTTPError:
             raise download
 
         self.filename = self.used_url['filename']
@@ -249,10 +242,7 @@ class BuildrootPackage():
         Keyword arguments:
         tmp_path -- directory where you want the package to be extracted
         """
-        if six.PY2:
-            as_file = StringIO.StringIO(self.as_string)
-        else:
-            as_file = io.BytesIO(self.as_string)
+        as_file = io.BytesIO(self.as_string)
         if self.filename[-3:] == 'zip':
             with zipfile.ZipFile(as_file) as as_zipfile:
                 tmp_pkg = os.path.join(tmp_path, self.buildroot_name)
@@ -291,15 +281,20 @@ class BuildrootPackage():
             folder=tmp_pkg,
             name=pkg_filename)
 
-    def load_setup(self):
-        """
-        Loads the corresponding setup and store its metadata
-        """
+    def __load_setup_module(self):
         current_dir = os.getcwd()
         os.chdir(self.tmp_extract)
-        sys.path.append(self.tmp_extract)
+        sys.path.insert(0, self.tmp_extract)
         s_file, s_path, s_desc = imp.find_module('setup', [self.tmp_extract])
-        setup = imp.load_module('setup', s_file, s_path, s_desc)
+        try:
+            setup = imp.load_module('__main__', s_file, s_path, (".py", "r", imp.PY_SOURCE))
+        except KeyError:
+            # This highly likely means the module uses PEP-0517 and has dumb setup.py
+            # for the compatibility only. We have no choice but to try setup.cfg.
+            os.chdir(current_dir)
+            sys.path.remove(self.tmp_extract)
+            self.setup_metadata = None
+            return
         if self.metadata_name in self.setup_args:
             pass
         elif self.metadata_name.replace('_', '-') in self.setup_args:
@@ -309,12 +304,14 @@ class BuildrootPackage():
         try:
             self.setup_metadata = self.setup_args[self.metadata_name]
         except KeyError:
-            # This means setup was not called which most likely mean that it is
-            # called through the if __name__ == '__main__' directive.
-            # In this case, we can only pray that it is called through a
-            # function called main() in setup.py.
-            setup.main()  # Will raise AttributeError if not found
-            self.setup_metadata = self.setup_args[self.metadata_name]
+            # This means setup was not called. In this case, we can
+            # only pray that it is called through a function called
+            # main() in setup.py.
+            try:
+                setup.main()  # Will raise AttributeError if not found
+                self.setup_metadata = self.setup_args[self.metadata_name]
+            except AttributeError:
+                pass
         # Here we must remove the module the hard way.
         # We must do this because of a very specific case: if a package calls
         # setup from the __main__ but does not come with a 'main()' function,
@@ -325,18 +322,50 @@ class BuildrootPackage():
         os.chdir(current_dir)
         sys.path.remove(self.tmp_extract)
 
-    def get_requirements(self, pkg_folder):
+    def __load_setup_file(self):
+        self.setup_metadata = read_configuration("{}/setup.cfg".format(self.tmp_extract))
+        self.setup_metadata['method'] = 'setuptools'
+
+    def load_setup(self):
         """
-        Retrieve dependencies from the metadata found in the setup.py script of
-        a pypi package.
+        Loads the corresponding setup and store its metadata
+        """
+        if os.path.exists("{}/setup.py".format(self.tmp_extract)):
+            self.__load_setup_module()
+            if not self.setup_metadata is None:
+                return False
+        if os.path.exists("{}/setup.cfg".format(self.tmp_extract)):
+            self.__load_setup_file()
+            return True
+        if self.setup_metadata is None:
+            self.setup_metadata = dict()
+            self.setup_metadata['method'] = 'setuptools'
+            return False
+
+    def __check_requirements(self, metadata):
+        pkg_req = set()
+        if 'install_requires' in metadata:
+            pkg_req.update(metadata['install_requires'])
+        if 'setup_requires' in metadata:
+            pkg_req.update(metadata['setup_requires'])
+        return None if len(pkg_req) == 0 else pkg_req
+
+    def get_requirements(self, pkg_folder, is_pep0517):
+        """
+        Retrieve dependencies from the metadata found in the setup.py script
+        or setup.cfg file of a pypi package.
 
         Keyword Arguments:
         pkg_folder -- location of the already created packages
+        is_pep0517 -- specifies whether package has setup.cfg file
         """
-        if 'install_requires' not in self.setup_metadata:
-            self.pkg_req = None
+        self.pkg_req = None
+        if is_pep0517 and 'options' in self.setup_metadata:
+            self.pkg_req = self.__check_requirements(self.setup_metadata['options'])
+        elif not is_pep0517:
+            self.pkg_req = self.__check_requirements(self.setup_metadata)
+        if self.pkg_req is None:
             return set()
-        self.pkg_req = self.setup_metadata['install_requires']
         self.pkg_req = [re.sub(r'([-.\w]+).*', r'\1', req)
                         for req in self.pkg_req]
 
@@ -637,7 +666,6 @@ class BuildrootPackage():
         with open(path_to_config, 'w') as config_file:
             config_file.writelines(lines)
 
-
 def main():
     # Building the parser
     parser = argparse.ArgumentParser(
@@ -672,7 +700,7 @@ def main():
             print('Fetching package', package.real_name)
             try:
                 package.fetch_package_info()
-            except (six.moves.urllib.error.URLError, six.moves.urllib.error.HTTPError):
+            except (urllib.error.URLError, urllib.error.HTTPError):
                 continue
             if package.metadata_name.lower() == 'setuptools':
                 # setuptools imports itself, that does not work very well
@@ -682,7 +710,7 @@ def main():
 
             try:
                 package.download_package()
-            except six.moves.urllib.error.HTTPError as error:
+            except urllib.error.HTTPError as error:
                 print('Error: {code} {reason}'.format(code=error.code,
                                                       reason=error.reason))
                 print('Error downloading package :', package.buildroot_name)
@@ -698,10 +726,11 @@ def main():
                 continue
 
             # Loading the package install info from the package
+            is_pep0517 = False
             try:
-                package.load_setup()
+                is_pep0517 = package.load_setup()
             except ImportError as err:
-                if 'buildutils' in err.message:
+                if 'buildutils' in str(err):
                     print('This package needs buildutils')
                 else:
                     raise
@@ -712,8 +741,10 @@ def main():
                 continue
 
             # Package requirement are an argument of the setup function
-            req_not_found = package.get_requirements(pkg_folder)
+            req_not_found = package.get_requirements(pkg_folder, is_pep0517)
             req_not_found = req_not_found.difference(packages)
+
+            req_not_found.discard("pywin32")
 
             packages += req_not_found
             if req_not_found:
